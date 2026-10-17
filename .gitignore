@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 usage_history.json
+usb_tether_today.json
 .workbuddy/
 .venv/

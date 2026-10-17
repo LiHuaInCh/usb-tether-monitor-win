@@ -241,7 +241,8 @@ def _largest_pt(text, max_w, bold, scale, ss, base=13.0, floor=9.0):
 def render_float_card(snapshot, today, scale=1.0, alpha=204):
     """渲染悬浮窗卡片为 RGBA 图（2x 超采样后降采样，边缘平滑）。
 
-    snapshot: Monitor.snapshot()；today: (rx, tx, ok) 今日总用量（系统记录）。
+    snapshot: Monitor.snapshot()；today: (rx, tx, ok) 今日总用量（混合口径：
+    系统「数据使用量」在参考时刻的快照 + psutil 实时增量，实时准确）。
     alpha: 卡片底色不透明度 0~255（默认 204=80%；255 为不透明）。
     - 整卡铺一层带 alpha 的深色（>0 才能命中鼠标）
     - 所有文字带柔和暗影，浅色壁纸下也清晰
@@ -384,6 +385,29 @@ def _query_app_usage(profile, start, end):
         cur[0] += int(u.bytes_received)
         cur[1] += int(u.bytes_sent)
     return agg
+
+
+# 今日用量基线状态：记录「今日 00:00」的网卡计数，跨监控重启/零点翻篇复用。
+_TODAY_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "usb_tether_today.json")
+
+
+def _load_today_state():
+    try:
+        import json
+        with open(_TODAY_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_today_state(state):
+    try:
+        import json
+        with open(_TODAY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 
 def app_usage_total(iface_name, days=30):
@@ -678,10 +702,54 @@ def run_float():
         pos["x"], pos["y"] = rect[0], rect[1]
     last_img = {"img": None}
 
-    # 今日总用量（来自系统「数据使用量」记录，后台线程每 30 秒刷新）
-    today_usage = {"rx": 0.0, "tx": 0.0, "ok": False}
+    # 今日总用量：直接基于 psutil 网卡计数器计算「自 00:00 以来的真实流量」，
+    #   实时、准确。系统「数据使用量」会延迟几十秒批量入账、短时窗漏记，且实测
+    #   比真实流量少约 20%（还会把上传方向记反/多记），单用它做今日总量会偏低且滞后。
+    #   本机每天 08:20 左右开机 → 计数器在当日 00:00 时为 0 → 今日总量 = 当前计数 - 0。
+    #   跨零点 / 中途重启：用持久化基线（必要时以系统记录反推）保证翻篇正确。
+    today_usage = {"mode": "system", "base_rx": 0.0, "base_tx": 0.0, "ok": False}
     _usage_lock = threading.Lock()
     tick = {"n": 0}
+
+    def _psutil_now():
+        """当前网卡收发字节（psutil，实时、准确）；取不到返回 None。"""
+        try:
+            io = psutil.net_io_counters(pernic=True).get(
+                getattr(MONITOR, "iface", None))
+            return (io.bytes_recv, io.bytes_sent) if io else None
+        except Exception:
+            return None
+
+    def _establish_baseline(system_rx, system_tx):
+        """确定「今日 00:00」的网卡计数基线 (rx, tx)，写入持久化状态并返回。"""
+        today_str = datetime.date.today().isoformat()
+        cur = _psutil_now()
+        if cur is None:
+            return None
+        state = _load_today_state()
+        same_day = state and state.get("date") == today_str
+        rebooted = bool(same_day and (cur[0] < state.get("last_rx", 0)
+                                      or cur[1] < state.get("last_tx", 0)))
+        # 同一天且未重启（当前计数 >= 上次）：沿用已持久化的基线（监控重启不丢）
+        if same_day and not rebooted:
+            base = (state["baseline_rx"], state["baseline_tx"])
+            _save_today_state({"date": today_str,
+                               "baseline_rx": base[0], "baseline_tx": base[1],
+                               "last_rx": cur[0], "last_tx": cur[1]})
+            return base
+        # 新的一天，或中途重启：重建基线
+        booted_today = (datetime.date.fromtimestamp(psutil.boot_time())
+                       == datetime.date.today())
+        if booted_today and not rebooted:
+            base = (0.0, 0.0)            # 计数器在当日 00:00 时为 0
+        else:
+            # 开机早于今天，或中途重启：用系统记录反推 00:00 基线（最佳近似）
+            base = (max(0.0, cur[0] - system_rx),
+                    max(0.0, cur[1] - system_tx))
+        _save_today_state({"date": today_str,
+                           "baseline_rx": base[0], "baseline_tx": base[1],
+                           "last_rx": cur[0], "last_tx": cur[1]})
+        return base
 
     def refresh_today_usage():
         def work():
@@ -695,19 +763,35 @@ def run_float():
                 data = app_usage_total(getattr(MONITOR, "iface", None), 1)
             except Exception:
                 data = None
-            rx = sum(v[0] for v in data.values()) if data else 0.0
-            tx = sum(v[1] for v in data.values()) if data else 0.0
+            srx = sum(v[0] for v in data.values()) if data else 0.0
+            stx = sum(v[1] for v in data.values()) if data else 0.0
+            base = _establish_baseline(srx, stx)
+            cur = _psutil_now()
             with _usage_lock:
-                today_usage.update(rx=rx, tx=tx, ok=bool(data))
+                if base is not None and cur is not None:
+                    # 正常：用 psutil 计数器 - 00:00 基线（实时、准确）
+                    today_usage.update(mode="psutil", base_rx=base[0],
+                                       base_tx=base[1], ok=True)
+                else:
+                    # 退化：psutil 取不到时直接用系统记录（可能滞后/偏低）
+                    today_usage.update(mode="system", base_rx=srx,
+                                       base_tx=stx, ok=bool(data))
         threading.Thread(target=work, daemon=True).start()
 
     def paint():
         """渲染一张卡片并按当前位置贴到分层窗口。"""
         try:
             d = get_stats()
+            cur = _psutil_now()
             with _usage_lock:
-                today = (today_usage["rx"], today_usage["tx"],
-                         today_usage["ok"])
+                tu = dict(today_usage)
+            if tu["mode"] == "psutil" and cur is not None:
+                # 用最新实时计数 - 00:00 基线，消除 30s 刷新间隔带来的滞后
+                rx = max(0.0, cur[0] - tu["base_rx"])
+                tx = max(0.0, cur[1] - tu["base_tx"])
+                today = (rx, tx, True)
+            else:
+                today = (tu["base_rx"], tu["base_tx"], tu["ok"])
             img = render_float_card(d, today, scale)   # 固定 80% 淡底
             last_img["img"] = img
             ulw_paint(hwnd, img, pos["x"], pos["y"])

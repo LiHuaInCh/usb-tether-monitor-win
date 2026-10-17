@@ -387,15 +387,16 @@ def _query_app_usage(profile, start, end):
 
 
 def app_usage_total(iface_name, days=30):
-    """各软件最近 N 天累计用量 {名称: [rx, tx]}；找不到网卡记录返回 None。"""
+    """各软件最近 N 天累计用量 {名称: [rx, tx]}（含今天，起自相应日期 00:00）；
+    找不到网卡记录返回 None。"""
     if not HAVE_APPUSAGE or not iface_name:
         return None
     profile = _find_connection_profile(iface_name)
     if profile is None:
         return None
     now = datetime.datetime.now()
-    start = (now - datetime.timedelta(days=days)).replace(
-        hour=0, minute=0, second=0, microsecond=0)
+    today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today0 - datetime.timedelta(days=max(1, days) - 1)
     return _query_app_usage(profile, start, now)
 
 

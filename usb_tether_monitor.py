@@ -426,6 +426,16 @@ class Monitor:
                 "ts": time.time(),
             }
 
+    def reset(self):
+        """重新监控：清零本次会话累计收发与速率，重置监测起始时刻与差分基准。"""
+        with self.lock:
+            self.rx_total = 0.0
+            self.tx_total = 0.0
+            self.rx_rate = 0.0
+            self.tx_rate = 0.0
+        self.start_time = time.time()
+        self._prev = None   # 下一采样重新建立基准，避免清零后瞬间跳变
+
 MONITOR = None
 
 
@@ -514,11 +524,12 @@ def run_float():
     root.bind("<Button-1>", start_drag)
     root.bind("<B1-Motion>", on_drag)
 
-    # 右键菜单（仅保留置顶切换与退出）
+    # 右键菜单（置顶切换、重新监控、退出）
     menu = tk.Menu(root, tearoff=0, bg="#161b22", fg="#c9d1d9",
                   activebackground="#1f6feb", activeforeground="#ffffff")
     menu.add_command(label="置顶 / 置底", command=lambda: root.attributes(
         "-topmost", not root.attributes("-topmost")))
+    menu.add_command(label="重新监控", command=lambda: MONITOR.reset())
     menu.add_command(label="退出", command=lambda: (root.destroy(), sys.exit(0)))
     root.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 

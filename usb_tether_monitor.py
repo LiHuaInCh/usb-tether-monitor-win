@@ -45,7 +45,7 @@ except Exception:
 # 浅色背景下不清晰。改用 ULW 逐像素 alpha：
 #   · 整卡以极低 alpha（>0）铺底 → 视觉近透明，但整卡都可接收鼠标事件；
 #   · 文字带柔和暗影 + 真逐像素抗锯齿 → 任何背景下清晰。
-FLOAT_W, FLOAT_H = 188, 96    # 悬浮窗逻辑尺寸（96 DPI 像素）
+FLOAT_W, FLOAT_H = 188, 106   # 悬浮窗逻辑尺寸（96 DPI 像素）
 
 try:
     from ctypes import wintypes as _wintypes
@@ -282,6 +282,9 @@ def render_float_card(snapshot, today, scale=1.0, alpha=204):
                     f_sm, PURPLE))
     else:
         ops.append(("L", 10, 78, "本次总量 0 B", f_sm, DIM))
+    # 预计 GB/H（基于本次平均速率外推：本次总量 ÷ 监测时长 × 3600s ÷ 1GB）
+    gph = snapshot.get("gph", 0.0)
+    ops.append(("L", 10, 92, "预计 %.2f GB/H" % gph, f_sm, AMBER))
 
     def draw_ops(layer, fill=None):
         for mode, x, y, text, font, f in ops:
@@ -422,7 +425,9 @@ class Monitor:
                 "tx_rate_h": human_rate(self.tx_rate),
                 "rx_total_h": human_size(self.rx_total),
                 "tx_total_h": human_size(self.tx_total),
-                "uptime": time.time() - self.start_time,
+                "uptime": (up := (time.time() - self.start_time)),
+                "gph": ((self.rx_total + self.tx_total) / up * 3600 / (1024 ** 3))
+                       if up > 1e-6 else 0.0,
                 "ts": time.time(),
             }
 

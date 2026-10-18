@@ -277,14 +277,21 @@ def render_float_card(snapshot, today, scale=1.0, alpha=204):
          f_sm, GRAY),
     ]
     trx, ttx, tok = today
-    if tok:
-        ops.append(("L", 10, 78, "本次总量 %s" % human_size(trx + ttx),
-                    f_sm, PURPLE))
-    else:
-        ops.append(("L", 10, 78, "本次总量 0 B", f_sm, DIM))
-    # 预计 GB/H（基于最近 15 秒实测流量外推，右对齐放在本次总量右侧）
-    gph = snapshot.get("gph", 0.0)
-    ops.append(("R", FLOAT_W - 10, 78, "预计 %.2f GB/H" % gph, f_sm, AMBER))
+    left_txt = ("本次总量 %s" % human_size(trx + ttx)) if tok else "本次总量 0 B"
+    # 预计 GB/H：本次总量 ÷ 监测时长 × 3600s ÷ 1GB（右对齐放在本次总量右侧）
+    right_txt = "预计 %.2f GB/H" % snapshot.get("gph", 0.0)
+    # 底部一行左右分列：字号自适应收缩，保证总量数值再长也不会与预计重叠
+    gap = 6.0
+    avail = (FLOAT_W - 20 - gap) * scale * ss
+    bot_pt = 8.0
+    while bot_pt > 6.0:
+        f_try = _float_font(bot_pt, False, scale, ss)
+        if (f_try.getlength(left_txt) + f_try.getlength(right_txt)) <= avail:
+            break
+        bot_pt -= 0.5
+    f_bot = _float_font(bot_pt, False, scale, ss)
+    ops.append(("L", 10, 78, left_txt, f_bot, PURPLE if tok else DIM))
+    ops.append(("R", FLOAT_W - 10, 78, right_txt, f_bot, AMBER))
 
     def draw_ops(layer, fill=None):
         for mode, x, y, text, font, f in ops:
@@ -371,7 +378,6 @@ class Monitor:
         self.connected = False
         self.start_time = time.time()  # 监测启动时刻
         self._prev = None
-        self._hist = []        # 最近采样: (t, rx_bytes, tx_bytes)，保留约 15 秒
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._sample, daemon=True)
         self._thread.start()
@@ -407,15 +413,9 @@ class Monitor:
                             self.rx_rate = dr
                             self.tx_rate = tr
                 self._prev = (cur[0], cur[1], now)
-                with self.lock:
-                    self._hist.append((now, cur[0], cur[1]))
-                    while self._hist and self._hist[0][0] < now - 15.0:
-                        self._hist.pop(0)
             else:
                 self.connected = False
                 self._prev = None
-                with self.lock:
-                    self._hist.clear()
             time.sleep(1.0)
 
     def snapshot(self):
@@ -433,29 +433,11 @@ class Monitor:
                 "rx_total_h": human_size(self.rx_total),
                 "tx_total_h": human_size(self.tx_total),
                 "uptime": (up := (time.time() - self.start_time)),
-                # 预计 GB/H：按最近 15 秒实测流量外推（比全程平均更贴近当前，
-                # 减小瞬时误差）；采样不足 2 点时退化为 0
-                "gph": self._gph_15s(),
+                # 预计 GB/H：本次总量 ÷ 监测时长 × 3600s ÷ 1GB
+                "gph": ((self.rx_total + self.tx_total) / up * 3600 / (1024 ** 3))
+                       if up > 1e-6 else 0.0,
                 "ts": time.time(),
             }
-
-    def _gph_15s(self):
-        """按最近 15 秒实测流量外推的每小时用量（GB/H）。
-
-        取 _hist 窗口内最早与最新两个采样点求平均速率，比「本次总量 ÷ 监测时长」
-        的全程平均更贴近当前实际节奏，可减小瞬时误差。采样不足 2 点时返回 0。
-        """
-        hist = self._hist
-        if len(hist) < 2:
-            return 0.0
-        t0, r0, s0 = hist[0]
-        t1, r1, s1 = hist[-1]
-        dt = t1 - t0
-        if dt <= 1e-6:
-            return 0.0
-        r15 = max(0.0, (r1 - r0) / dt)
-        s15 = max(0.0, (s1 - s0) / dt)
-        return (r15 + s15) * 3600 / (1024 ** 3)
 
     def reset(self):
         """重新监控：清零本次会话累计收发与速率，重置监测起始时刻与差分基准。"""
@@ -466,7 +448,6 @@ class Monitor:
             self.tx_rate = 0.0
         self.start_time = time.time()
         self._prev = None   # 下一采样重新建立基准，避免清零后瞬间跳变
-        self._hist.clear()  # 清空 15 秒窗口，预计值随之归零
 
 MONITOR = None
 
